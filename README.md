@@ -18,22 +18,23 @@ explícita tuya.
 ## Índice
 
 1. [Características](#1-características)
-2. [Requisitos](#2-requisitos)
-3. [Instalación](#3-instalación)
-4. [Estructura del proyecto](#4-estructura-del-proyecto)
-5. [Flujo de trabajo recomendado](#5-flujo-de-trabajo-recomendado)
-6. [Uso detallado de cada script](#6-uso-detallado-de-cada-script)
-   - [6.1 auditoria.py](#61-auditoriapy--auditoría-de-solo-lectura)
-   - [6.2 organizar.py](#62-organizarpy--ordenamiento-por-añoymes)
-   - [6.3 unificar.py](#63-unificarpy--consolidación-en-carpeta-plana)
-   - [6.4 registro.py](#64-registropy--registro-de-respaldo-con-hash)
-   - [6.5 importar.py](#65-importarpy--importación-incremental)
-   - [6.6 dedup.py](#66-deduppy--deduplicación-final)
-7. [Cadena de prioridad de fechas](#7-cadena-de-prioridad-de-fechas)
-8. [Garantías de seguridad](#8-garantías-de-seguridad)
-9. [Privacidad: qué no se sube a GitHub](#9-privacidad-qué-no-se-sube-a-github)
-10. [Solución de problemas](#10-solución-de-problemas)
-11. [Licencia y créditos](#11-licencia-y-créditos)
+2. [Cómo funciona por dentro](#2-cómo-funciona-por-dentro)
+3. [Requisitos](#3-requisitos)
+4. [Instalación](#4-instalación)
+5. [Estructura del proyecto](#5-estructura-del-proyecto)
+6. [Flujo de trabajo recomendado](#6-flujo-de-trabajo-recomendado)
+7. [Uso detallado de cada script](#7-uso-detallado-de-cada-script)
+   - [7.1 auditoria.py](#71-auditoriapy--auditoría-de-solo-lectura)
+   - [7.2 organizar.py](#72-organizarpy--ordenamiento-por-añoymes)
+   - [7.3 unificar.py](#73-unificarpy--consolidación-en-carpeta-plana)
+   - [7.4 registro.py](#74-registropy--registro-de-respaldo-con-hash)
+   - [7.5 importar.py](#75-importarpy--importación-incremental)
+   - [7.6 dedup.py](#76-deduppy--deduplicación-final)
+8. [Cadena de prioridad de fechas](#8-cadena-de-prioridad-de-fechas)
+9. [Garantías de seguridad](#9-garantías-de-seguridad)
+10. [Privacidad: qué no se sube a GitHub](#10-privacidad-qué-no-se-sube-a-github)
+11. [Solución de problemas](#11-solución-de-problemas)
+12. [Licencia](#12-licencia)
 
 ---
 
@@ -52,7 +53,103 @@ explícita tuya.
 
 ---
 
-## 2. Requisitos
+## 2. Cómo funciona por dentro
+
+Entender este flujo te permite interpretar cada reporte y cada columna de los CSV
+que generan los scripts.
+
+### 2.1 Recorrido y filtrado
+
+1. El script recorre **recursivamente** la carpeta `--origen` con `os.walk`.
+2. Descarta subcarpetas que no debe tocar: si el destino o la propia carpeta del
+   proyecto están dentro del origen, se **podan del recorrido** (nunca se
+   procesan a sí mismas).
+3. Filtra por **extensión multimedia** (JPG, PNG, HEIC, RAW de varias marcas,
+   MP4, MOV, AVI, MKV, 3GP… — la lista completa está en
+   `src/exif_utils.py`, constantes `EXT_IMAGENES` y `EXT_VIDEOS`). Con
+   `--extensiones` podés reducir ese conjunto según lo que indique tu auditoría.
+4. Para cada archivo que pasa el filtro se lee su **tamaño**; ese tamaño es la
+   primera clave para detectar duplicados (dos archivos con distinto tamaño no
+   pueden ser idénticos).
+
+### 2.2 Lectura de metadatos en lote con ExifTool
+
+En vez de lanzar ExifTool una vez por archivo (miles de procesos, muy lento), se
+lo invoca **una sola vez por lote de 200 archivos** en modo JSON:
+
+```
+exiftool.exe -j -G -n -EXIF:DateTimeOriginal -EXIF:DateTimeDigitized ... lote_de_200_archivos
+```
+
+- **Por qué 200:** Windows tiene un límite de ~32.767 caracteres por línea de
+  comandos; con lotes de 200 rutas largas jamás se supera.
+- **`-G`** prefixa cada etiqueta con su grupo (`EXIF:`, `QuickTime:`, `File:`),
+  lo que permite comparar prioridades sin ambigüedad.
+- Si un lote falla parcialmente, ExifTool igual emite el JSON de los archivos
+  que sí pudo leer; el script lo aprovecha en lugar de abortar.
+- El resultado se guarda en un diccionario `{ruta_normalizada: {tag: valor}}`.
+  Como ExifTool puede reemplazar caracteres no ASCII por `?` en Windows, la
+  búsqueda posterior tolera eso: si la ruta exacta no está, se empareja por
+  **(nombre de archivo + tamaño)**, que es inmune a ese problema.
+
+### 2.3 Selección de la fecha
+
+Para cada archivo se aplica la **cadena de prioridad** (sección 8): se toma la
+primera fecha disponible, se **normaliza** a `AAAA-MM-DD HH:MM:SS` (acepta
+`2023:06:15 14:30:22`, variantes con guiones, con zona horaria, o solo fecha) y
+se valida (mes 1-12, día 1-31, hora ≤ 23...). Si la fecha no es plausible
+(ej. mes `13`), se descarta y se sigue con la siguiente fuente.
+
+Esa fecha determina la carpeta de destino: `destino\AAAA\MM\`. Si no hay ninguna
+fecha, el archivo cae en `destino\sin_fecha\`.
+
+### 2.4 Copia y resolución de colisiones
+
+Antes de copiar, se decide el nombre final:
+
+1. Si **no existe** un archivo con ese nombre en la carpeta destino → se copia
+   con el nombre original.
+2. Si **existe y el contenido es idéntico** (mismo tamaño + mismo MD5) → se
+   **omite**: ya está respaldado (estado `omitido-ya-existente`). No gasta
+   espacio duplicado.
+3. Si **existe pero el contenido es distinto** → se prueba `nombre_1.ext`,
+   `nombre_2.ext`... hasta encontrar un hueco. **Jamás se sobrescribe nada.**
+
+En `unificar.py` e `importar.py` la copia es **verificada**: se copia a un
+archivo temporal, se recalcula tamaño + MD5 del destino y se compara con el
+origen; recién entonces se renombra al definitivo. Si la verificación falla, el
+temporal se borra y el archivo queda registrado como `error` (nunca se queda una
+copia corrupta silenciosamente).
+
+### 2.5 Deduplicación
+
+- **Detección rápida** (`auditoria.py`): agrupa por `(tamaño, hash de muestra)`,
+  donde la muestra son 16 KB del inicio + medio + final del archivo. Barato de
+  calcular; sirve para *candidatos*.
+- **Confirmación total** (`dedup.py`, `unificar.py`): MD5 del archivo completo.
+  Solo entonces se afirma que dos archivos son idénticos.
+
+### 2.6 Trazabilidad y reanudación
+
+Cada acción queda escrita en un CSV de `logs\` con su **estado** (ver el
+significado de cada estado en la sección 11). Esos CSV son además la base de la
+**reanudación**: al re-ejecutar un script, las rutas ya procesadas con éxito se
+leen del CSV y se **omite** — por eso podés cortar una ejecución de 50 GB y
+volver a lanzarla sin repetir trabajo.
+
+### 2.7 Registro e importación incremental (el "cerebro" del respaldo)
+
+1. `registro.py` hashea (MD5 completo) cada archivo de la carpeta de respaldo y
+   lo anota en `registro\respaldo.csv` → tenés un inventario verificable de lo
+   que ya tenés.
+2. `importar.py` hashea cada archivo de una carpeta nueva y lo compara contra
+   ese CSV por **(tamaño + MD5)**: si el contenido ya está registrado **no lo
+   copia aunque tenga otro nombre**; si es nuevo, lo copia, verifica y agrega su
+   fila al registro para las próximas importaciones.
+
+---
+
+## 3. Requisitos
 
 | Requisito | Detalle |
 |---|---|
@@ -66,12 +163,12 @@ explícita tuya.
 
 ---
 
-## 3. Instalación
+## 4. Instalación
 
 ```powershell
 # 1) Clonar el repositorio
-git clone https://github.com/TU_USUARIO/ordenar_fotos.git
-cd ordenar_fotos
+git clone https://github.com/ProyectosCzh/DocsOrganizator.git
+cd DocsOrganizator
 
 # 2) Verificar que Python y ExifTool responden
 python --version
@@ -92,11 +189,11 @@ descargá la versión oficial desde **https://exiftool.org/** y reemplazá
 
 ---
 
-## 4. Estructura del proyecto
+## 5. Estructura del proyecto
 
 ```
 ordenar_fotos/
-├── README.md               ← este documento
+├── README.md               ← este documento (guía completa)
 ├── LICENSE                 ← licencia MIT del código + nota de ExifTool
 ├── .gitignore              ← excluye datos privados y salidas
 │
@@ -112,9 +209,6 @@ ordenar_fotos/
 │   ├── importar.py         ← importación incremental (solo lo nuevo)
 │   └── dedup.py            ← FASE 3: deduplicación final (opcional)
 │
-├── docs/
-│   └── PLAN_DETALLADO.md   ← diseño técnico completo de la herramienta
-│
 ├── logs/                   ← LO CREA EN EJECUCIÓN (ignorado por git)
 ├── reportes/               ← LO CREA EN EJECUCIÓN (ignorado por git)
 └── registro/               ← LO CREA EN EJECUCIÓN (ignorado por git)
@@ -122,7 +216,7 @@ ordenar_fotos/
 
 ---
 
-## 5. Flujo de trabajo recomendado
+## 6. Flujo de trabajo recomendado
 
 ```
                     ┌──────────────────────────────┐
@@ -155,12 +249,12 @@ ordenar_fotos/
 
 ---
 
-## 6. Uso detallado de cada script
+## 7. Uso detallado de cada script
 
 > Todos los comandos se ejecutan desde la **raíz del proyecto**.
 > Entre comillas van tus rutas reales; usá comillas cuando tengan espacios.
 
-### 6.1 `auditoria.py` — Auditoría de solo lectura
+### 7.1 `auditoria.py` — Auditoría de solo lectura
 
 Escanea la carpeta origen y genera reportes **sin modificar, mover ni eliminar
 nada**. Hacé esto siempre primero.
@@ -194,7 +288,7 @@ hay suficientes duplicados como para justificar `dedup.py`.
 
 ---
 
-### 6.2 `organizar.py` — Ordenamiento por Año\Mes
+### 7.2 `organizar.py` — Ordenamiento por Año\Mes
 
 Copia cada archivo multimedia a `destino\YYYY\MM\` según su fecha de captura
 real. **El origen queda intacto.**
@@ -243,11 +337,12 @@ destino\
 
 ---
 
-### 6.3 `unificar.py` — Consolidación en carpeta plana
+### 7.3 `unificar.py` — Consolidación en carpeta plana
 
 Alternativa a `organizar.py`: junta todo en **una sola carpeta plana** sin
 duplicados (conserva UNA copia de cada contenido único, decidida por heurística
-de nombre).
+de nombre: prefiere nombres con fecha parseable, más descriptivos y más cercanos
+a la raíz).
 
 ```powershell
 # Copia a unificadas\ (en la raíz del proyecto)
@@ -273,12 +368,14 @@ python src\unificar.py --origen "D:\Fotos Desordenadas" --destino "E:\General" -
 | `--sin-verificar` | No | Omitir la verificación MD5 post-copia |
 | `--yes` | No | No pedir confirmación en modo mover |
 
-**Reanudable:** el progreso queda en `logs\unificacion.csv`; al re-ejecutar
-omite lo ya procesado. Verificación post-copia: tamaño + MD5.
+**Optimización:** primero agrupa por tamaño y solo hashea los archivos que
+comparten tamaño con otro (los únicos que pueden ser duplicados). **Reanudable:**
+el progreso queda en `logs\unificacion.csv`; al re-ejecutar omite lo ya
+procesado y limpia temporales huérfanos (`.tmp_*`).
 
 ---
 
-### 6.4 `registro.py` — Registro de respaldo con hash
+### 7.4 `registro.py` — Registro de respaldo con hash
 
 Genera (o actualiza) el CSV con el **hash MD5 de cada archivo** de una carpeta.
 Es la base para saber qué ya tenés respaldado y para que `importar.py` no
@@ -315,7 +412,7 @@ modificación, origen), `resumen.txt`, `errores.txt`.
 
 ---
 
-### 6.5 `importar.py` — Importación incremental
+### 7.5 `importar.py` — Importación incremental
 
 Compara carpetas nuevas contra el registro por **(tamaño + MD5)** y copia solo
 lo que todavía no tenés, aunque tenga otro nombre.
@@ -349,11 +446,11 @@ Cada copia se **verifica** (tamaño + MD5) antes de registrarse: si la
 verificación falla, borra la copia dañada y la marca como error.
 
 > Ejecutá `registro.py` al menos una vez antes de importar; con el registro
-> vacío se copiaría todo.
+> vacío se copiaría todo (el propio script te avisa con un `AVISO`).
 
 ---
 
-### 6.6 `dedup.py` — Deduplicación final
+### 7.6 `dedup.py` — Deduplicación final
 
 Confirma duplicados con **hash MD5 completo** y, opcionalmente, mueve las copias
 redundantes a `duplicados\`. **Nunca borra.**
@@ -380,7 +477,7 @@ python src\dedup.py --carpeta "E:\Fotos_Ordenadas\destino" --salida "E:\Reportes
 
 ---
 
-## 7. Cadena de prioridad de fechas
+## 8. Cadena de prioridad de fechas
 
 Para cada archivo, se elige la **primera fecha disponible** en este orden:
 
@@ -399,7 +496,7 @@ los dudosos.
 
 ---
 
-## 8. Garantías de seguridad
+## 9. Garantías de seguridad
 
 | Garantía | Detalle |
 |---|---|
@@ -414,7 +511,7 @@ los dudosos.
 
 ---
 
-## 9. Privacidad: qué no se sube a GitHub
+## 10. Privacidad: qué no se sube a GitHub
 
 Los reportes y logs contienen **rutas reales de tus fotos**, nombres de
 archivos y carpetas privadas, y hashes. Por eso el `.gitignore` excluye
@@ -435,30 +532,56 @@ rutas completas.
 
 ---
 
-## 10. Solución de problemas
+## 11. Solución de problemas
+
+### Errores frecuentes
 
 | Problema | Solución |
 |---|---|
 | `ERROR: no se encontró exiftool.exe` | Verificá que `exiftool.exe` y `exiftool_files\` estén en la raíz del proyecto, o que `exiftool` esté en el PATH. Probá `.\exiftool.exe -ver` |
 | `python` no se reconoce | Reinstalá Python marcando **Add to PATH**, o usá `py` en lugar de `python` |
-| Muchos archivos en `sin_fecha` | Son formatos sin metadatos (WhatsApp, capturas, escaneos). Mirá `reporte_fechas.txt`; el patrón de nombre es el respaldo y la carpeta `sin_fecha\` queda para revisión manual |
-| Años absurdos en el histograma (p. ej. 1324) | Cámaras/relojes con la fecha mal configurada o fechas inválidas en EXIF. Se detectan en `reporte_fechas.txt`; se pueden corregir después con ExifTool |
-| Fecha marcada como `filesystem-dudosa` | No había metadatos ni fecha en el nombre: se usó la fecha del archivo, que es poco confiable. Revisá esos casos en `ordenacion.csv` |
-| `Acceso denegado` / archivo en uso | Cerrá el visor de fotos/copias que esté usando el archivo; queda registrado en `errores.txt` y no detiene el proceso |
+| `ERROR: la carpeta destino está DENTRO de la carpeta origen` | Elegí un destino fuera del origen (otra carpeta o disco); es una proteccion para que no se copien a sí mismos |
+| `Acceso denegado` / archivo en uso | Cerrá el visor de fotos que esté usando el archivo; queda en `errores.txt` y no detiene el proceso |
 | Espacio insuficiente | Apuntá `--destino` a otro disco, o usá `--modo mover` (con confirmación) |
 | Comandos largos con espacios | Usá siempre comillas dobles alrededor de las rutas |
 
+### Casos que no son errores
+
+| Síntoma | Qué significa |
+|---|---|
+| Muchos archivos en `sin_fecha` | Formatos sin metadatos (WhatsApp, capturas, escaneos). Mirá `reporte_fechas.txt`; revisá esa carpeta manualmente |
+| Años absurdos en el histograma (p. ej. 1324) | Cámaras/relojes con fecha mal configurada o EXIF inválido. Se ven en `reporte_fechas.txt` |
+| Fecha marcada como `filesystem-dudosa` | No había metadatos ni fecha en el nombre: se usó la fecha del archivo, poco confiable. Revisalos en `ordenacion.csv` |
+| `AVISO: el registro esta vacio` | Todavía no corriste `registro.py`; sin registro, `importar.py` copiaría todo |
+
+### Significado de cada estado en los CSV
+
+| Estado | Dónde aparece | Significado |
+|---|---|---|
+| `copiado` | `ordenacion.csv`, `unificacion.csv`, `importacion.csv` | Se creó la copia en el destino |
+| `movido` | `ordenacion.csv` | Se movió desde el origen (modo `--modo mover`) |
+| `omitido-ya-existente` | `ordenacion.csv` | Ya había un archivo con el mismo nombre **y** el mismo contenido en el destino |
+| `ya-existente` | `unificacion.csv` | Mismo caso, en `unificar.py` |
+| `duplicado-omitido` | `unificacion.csv` | Era duplicado de otro archivo ya conservado; no se copió (modo copiar) |
+| `duplicado-movido` | `unificacion.csv` | Era duplicado; se movió a `duplicados\` (modo mover) |
+| `ya-procesado` | `importacion.csv`, `unificacion.csv` | Ya figuraba en el log de una corrida anterior → reanudación |
+| `conservar` / `redundante` | `duplicados_confirmados.csv` | De un grupo de idénticos: uno se conserva, los demás son prescindibles |
+| `filesystem-dudosa` (columna *fuente*) | `ordenacion.csv` | La fecha usada vino del sistema de archivos: revisar |
+| `error` | todos los CSV | Falló la copia/verificación; el detalle está en `errores.txt` |
+
 ---
 
-## 11. Licencia y créditos
+## 12. Licencia
 
-- **Código de este proyecto:** MIT — ver [LICENSE](LICENSE).
-- **ExifTool** (`exiftool.exe` + `exiftool_files/`) es de **Phil Harvey**,
-  licencia **GPL / Artistic License**. Sitio oficial y descargas:
-  **https://exiftool.org/**
-  - Texto de la licencia: `exiftool_files/LICENSE`
-  - Licencias de los módulos de Perl incluidos: `exiftool_files/Licenses_Strawberry_Perl.zip`
-  - Para actualizarlo: descargá la versión nueva desde exiftool.org y
-    reemplazá `exiftool.exe` + `exiftool_files/`.
+**Código de este proyecto:** [MIT](LICENSE) — libre para usar, modificar y
+redistribuir, con la condición de conservar el aviso de copyright.
 
-El diseño técnico completo está en [docs/PLAN_DETALLADO.md](docs/PLAN_DETALLADO.md).
+**ExifTool** (`exiftool.exe` + `exiftool_files/`) es un componente de terceros
+de **Phil Harvey**, bajo licencia **GPL / Artistic License** (doble licencia),
+y **no** está cubierto por la licencia MIT de arriba.
+
+- Sitio oficial y descargas: **https://exiftool.org/**
+- Texto de la licencia: `exiftool_files/LICENSE`
+- Licencias de los módulos de Perl incluidos: `exiftool_files/Licenses_Strawberry_Perl.zip`
+- Para actualizar: descargá la versión nueva desde https://exiftool.org/ y
+  reemplazá `exiftool.exe` + `exiftool_files/`.
